@@ -8,6 +8,7 @@ MMExport2PDF.py [options]
 
 MMExport2PDF.py is used to export all a users channels and DMs from a team.
 
+```
 options:
   -h, --help            show this help message and exit
 
@@ -39,5 +40,6 @@ Export Options:
   -j, --json            Export JSON (default: False)
   -o OUTPUT, --output OUTPUT
                         Base output directory (default: ./users)
+```
 
 This can take a long time to run.
