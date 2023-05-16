@@ -1,357 +1,662 @@
-# Alexander J. Lallier
-# Mattermost Export Script
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+''' MMExport2PDF
+
+Using the Mattermost API, connects to an instance and exports
+all channel for a user on a team.
+
+Images and Files are downloaded as well.
+
+'''
+
+#########################
+## Python Imports
+##
+
+import argparse
 import requests
 import gzip
-import ujson as json
+import simplejson as json
+#import ujson as json
 import datetime
-import marko
 import shutil
 import sys
 import os
 from pathlib import Path
-from fpdf import FPDF, TitleStyle, HTMLMixin
 
-# File_object = open(r"MM1.md", "w", encoding='utf8')
+#import traceback
 
-mattermostURL = 'https://mattermost.tld/api/v4/'
-accessToken = ""
-userId = ''
-teamId = ''
+#########################
+## Thirdparty Imports
+##
 
-headers = {'Authorization': 'Bearer ' + accessToken}
+# fpdf is acutally PyFPDF2
+from fpdf import FPDF, TitleStyle, Align
+from fpdf.enums import FileAttachmentAnnotationName 
+
+__author__ = 'Alexander J. Lallier'
+__version__ = '1.0'
+__contact__ = ''
+
+
+
+#########################
+## Globals Variables
+##
+
+imageExtenstions = [ 'gif', 'png', 'jpeg', 'jpg' ]
+
+mattermostURL = ''
+headers = {}
+baseUserPath = ''
 
 users = {}
 channelCache = {}
 
-baseUserPath = ''
 
-# channelDisplayName = None
-channelDisplayName = 'Table of Contents'
+channelDisplayName = ''
 messageHeader = None
 tableOfContents = {}
 
+
+
+#########################
+## Exception Definitions
+##
+
+class OptionsException( Exception ):
+    def __init__(self, message = None ):
+        super(OptionsException,self).__init__(message)
+
+class UserInfoException( Exception ):
+    def __init__(self, message = None ):
+        super(UserInfoException,self).__init__(message)
+
+class UserIDException( Exception ):
+    def __init__(self, message = None ):
+        super(UserIDException,self).__init__(message)
+
+class TeamIDException( Exception ):
+    def __init__(self, message = None ):
+        super(TeamIDException,self).__init__(message)
+
+class UserChannelsException( Exception ):
+    def __init__(self, message = None ):
+        super(UserChannelsException,self).__init__(message)
+
+class ImageException( Exception ):
+    def __init__(self, message = None ):
+        super(ImageException,self).__init__(message)
+
+class FileException( Exception ):
+    def __init__(self, message = None ):
+        super(FileException,self).__init__(message)
+
+class ChannelPostsException( Exception ):
+    def __init__(self, message = None ):
+        super(ChannelPostsException,self).__init__(message)
+
+class ChannelMembersException( Exception ):
+    def __init__(self, message = None ):
+        super(ChannelMembersException,self).__init__(message)
+
+
+#########################
+## MMExport2PDF Options
+##
+
+def processOptions():
+    '''
+    Process command line arguments and set the internal options appropriately.
+
+            @param argv List of command line arguments.
+            @return The object containing the processed options.
+    '''
+    # process options
+
+    options = None
+
+    try:
+        usage = f'%(prog)s [options]'
+        description = '%(prog)s is used to export all a users channels and DMs from a team.'
+        epilog = 'This can take a long time to run.'
+
+        parser = argparse.ArgumentParser(usage=usage,
+                                         description=description,
+                                         epilog=epilog,
+                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+        usergroup = parser.add_argument_group(title='User Info')
+        usergroup.add_argument("-a", "--auth", help="Auth Token", action="store", dest="auth", required=True)
+        usergroup.add_argument("-u", "--user", help="Username of user to be exported", action="store", dest="user", required=True)
+        usergroup.add_argument("-t", "--team", help="Team to export from", action="store", dest="team", required=True)
+
+        servergroup = parser.add_argument_group(title='Server Info')
+        servergroup.add_argument("-s", "--server", help="Hostname or IP of the server", action="store", dest="server", default="mattermost.com")
+
+        categorygroup = parser.add_argument_group(title='Channel Categories')
+        categorygroup.add_argument("-p", "--public", help="Exclude public channels", action="store_false", dest="public")
+        categorygroup.add_argument("-P", "--private", help="Exclude private channels", action="store_false", dest="private")
+        categorygroup.add_argument("-g", "--groups", help="Exclude group messages", action="store_false", dest="group")
+        categorygroup.add_argument("-d", "--DMs", help="Exclude direct messages", action="store_false", dest="dms")
+
+        filtergroup = parser.add_argument_group(title='Message Filters')
+        filtergroup.add_argument("-I", "--include", help="Only inlcude these channels in the export.", nargs='*', dest="include", default=[])
+        filtergroup.add_argument("-E", "--exclude", help="Exclude these channels from the export", nargs='*', dest="exclude", default=[])
+
+        exportgroup = parser.add_argument_group(title='Export Options')
+        exportgroup.add_argument("-i", "--images", help="Embed images in PDF", action="store_true", dest="images")
+        exportgroup.add_argument("-f", "--files", help="Embed files in PDF", action="store_true", dest="files")
+        exportgroup.add_argument("-j", "--json", help="Export JSON", action="store_true", dest="json")
+        exportgroup.add_argument("-o", "--output", help="Base output directory", action="store", dest="output", default='./users')
+
+        options = parser.parse_args() # uses sys.argv[1:] by default
+
+
+    except Exception as e: #pylint: disable=broad-except
+        raise OptionsException( e )
+
+    return options
+
+
+#########################
+## Main
+##
+
 def main():
-  # Get all Channels for a User
-  getChannelsForAUser = f'users/{userId}/teams/{teamId}/channels?include_deleted=false&last_delete_at=0'
 
-  allChannelsForUserResponse = requests.get(mattermostURL + getChannelsForAUser, headers=headers)
+    try:
+        global baseUserPath
+        global mattermostURL
+        global headers
 
-  if (allChannelsForUserResponse.status_code != 200):
-    print("ERROR: Getting all channels for user")
-    exit()
+        options = processOptions()
 
-  allChannelsForUser = allChannelsForUserResponse.json()
+        if (not (options.public or options.private or options.group or options.dms) ):
+            raise OptionsException( 'At least one channel category must be exported' )
 
-  allChannelsForUser.reverse()
+        # Setup
+        mattermostURL = f'https://{options.server}/api/v4/'
+        headers['Authorization'] = f'Bearer {options.auth}'
 
-  hitPublicChannel = False
-  hitPrivateChannel = False
-  hitDMChannel = False
-  hitGroupMessages = False
+        userInfo = getUserFromName(options.user)
+        teamInfo = getTeam(options.team)
 
-  # Initialize PDF
-  pdf = PDF()
-  pdf.add_page()
-  pdf.set_auto_page_break(True, 15.0)
-  # pdf.insert_toc_placeholder(render_toc, pages=1)
+        baseUserPath = os.path.join( options.output, options.user )
+        baseUserFilePath = os.path.join( baseUserPath, 'files/' )
 
-  publicChannels = []
-  privateChannels = []
-  groupChannels = []
-  directMessageChannels = []
+        os.makedirs( baseUserPath, 0o755, True)
 
-  channelGroupingsList = []
+        # Start Working
+        allChannelsForUser = getChannelsForAUser(userInfo['id'], teamInfo['id'])
+        allChannelsForUser.reverse()
 
-  for channel in allChannelsForUser:
-    if (channel["type"] == 'O'):
-      publicChannels.append(channel)
 
-    if (channel["type"] == 'P'):
-      privateChannels.append(channel)
+        hitPublicChannel = False
+        hitPrivateChannel = False
+        hitDMChannel = False
+        hitGroupMessages = False
 
-    if (channel["type"] == 'D'):
-      directMessageChannels.append(channel)
+        # Initialize PDF
+        pdf = PDF()
+        pdf.add_page()
+        pdf.set_auto_page_break(True, 15.0)
 
-    if (channel["type"] == 'G'):
-      groupChannels.append(channel)
+        publicChannels = []
+        privateChannels = []
+        groupChannels = []
+        directMessageChannels = []
 
-  # Pre-process names in direct messages so we can sort by the other user's name
-  for channel in directMessageChannels:
-    channel['full_name'] = directMessageOtherUserName(channel)
+        channelGroupingsList = []
+        
+        for channel in allChannelsForUser:            
+            if ( channel["display_name"] not in options.exclude):
+                if ( (not options.include) or (channel["display_name"] in options.include) ):
+                    if (options.public and channel["type"] == 'O'):
+                        publicChannels.append(channel)
 
-  # Sort alphabetical
-  publicChannels = sorted(publicChannels, key = lambda i: (i['name']))
-  privateChannels = sorted(privateChannels, key = lambda i: (i['name']))
-  groupChannels = sorted(groupChannels, key = lambda i: (i['name']))
-  directMessageChannels = sorted(directMessageChannels, key = lambda i: (i['full_name']))
+                    if (options.private and channel["type"] == 'P'):
+                        privateChannels.append(channel)
 
-  channelGroupingsList = publicChannels + privateChannels + groupChannels + directMessageChannels
+                    if (options.dms and channel["type"] == 'D'):
+                        directMessageChannels.append(channel)
 
-  for channel in channelGroupingsList:
+                    if (options.group and channel["type"] == 'G'):
+                        groupChannels.append(channel)
 
-    messagesArray = []
-    pinnedMessages = []
+        # Pre-process names in direct messages so we can sort by the other user's name
+        for channel in directMessageChannels:
+            channel['full_name'] = directMessageOtherUserName(channel, userInfo['id'])
 
-    # Setup Channel Name and Headers for printing
-    setupChannelNameAndHeader(channel)
+        # Sort alphabetical
 
-    if (channel["type"] == 'O' and hitPublicChannel == False):
-      pdf.set_fill_color(255, 165, 0)
-      pdf.start_section("PUBLIC CHANNELS")
-      # pdf.cell(0, 15, "PUBLIC CHANNELS", 0, 2, 'C', True)
-      hitPublicChannel = True
+        publicChannels = sorted(publicChannels, key = lambda i: (i['name']))
+        privateChannels = sorted(privateChannels, key = lambda i: (i['name']))
+        groupChannels = sorted(groupChannels, key = lambda i: (i['name']))
+        directMessageChannels = sorted(directMessageChannels, key = lambda i: (i['full_name']))
 
-    if (channel["type"] == 'P' and hitPrivateChannel == False):
-      pdf.set_fill_color(255, 165, 0)
-      pdf.start_section("PRIVATE CHANNELS")
-      # pdf.cell(0, 15, "PRIVATE CHANNELS", 0, 2, 'C', True)
-      hitPrivateChannel = True
+        channelGroupingsList = publicChannels + privateChannels + groupChannels + directMessageChannels
+        
+        if not channelGroupingsList:
+            raise ChannelPostsException( "No posts matched the export criteria" )
+        
+        for channel in channelGroupingsList:
 
-    if (channel["type"] == 'D' and hitDMChannel == False):
-      pdf.set_fill_color(255, 165, 0)
-      pdf.start_section("DIRECT MESSAGE CHANNELS")
-      # pdf.cell(0, 15, "DIRECT MESSAGE CHANNELS", 0, 2, 'C', True)
-      hitDMChannel = True
+            messagesArray = []
+            pinnedMessages = []
 
-    if (channel["type"] == 'G' and hitGroupMessages == False):
-      pdf.set_fill_color(255, 165, 0)
-      pdf.start_section("GROUP MESSAGE CHANNELS")
-      # pdf.cell(0, 15, "GROUP MESSAGE CHANNELS", 0, 2, 'C', True)
-      hitGroupMessages = True
+            # Setup Channel Name and Headers for printing
+            setupChannelNameAndHeader(channel, userInfo['id'])
 
-    print(channelDisplayName)
-    # File_object.write("## " + channelDisplayName + '\n\n')
-    pdf.set_fill_color(255, 0, 0)
-    pdf.start_section(channelDisplayName, level=1)
-    # pdf.set_link(tableOfContents[channel["display_name"]])
-    # pdf.multi_cell(0, 5, messageHeader, 0, 'L', True)
-    # pdf.ln()
+            if (channel["type"] == 'O' and hitPublicChannel == False):
+                pdf.set_fill_color(255, 165, 0)
+                pdf.start_section("PUBLIC CHANNELS")
+                hitPublicChannel = True
 
-    channelId = channel["id"]
+            if (channel["type"] == 'P' and hitPrivateChannel == False):
+                pdf.set_fill_color(255, 165, 0)
+                pdf.start_section("PRIVATE CHANNELS")
+                hitPrivateChannel = True
 
-    morePages = True
-    channelPostsCounter = 0
-    allPosts = []
-    allPostsFull = []
-    # Get all pages and append messages to one array. We reverse this array before processing so order is from older to newest when printing
-    while (morePages):
-      getPostsForChannel = f'channels/{channelId}/posts?page={channelPostsCounter}'
+            if (channel["type"] == 'D' and hitDMChannel == False):
+                pdf.set_fill_color(255, 165, 0)
+                pdf.start_section("DIRECT MESSAGE CHANNELS")
+                hitDMChannel = True
 
-      try:
-        allPostsForChannelResponse = requests.get(mattermostURL + getPostsForChannel, headers=headers)
-      except:
-        print('ERROR ON GETTING PAGE')
+            if (channel["type"] == 'G' and hitGroupMessages == False):
+                pdf.set_fill_color(255, 165, 0)
+                pdf.start_section("GROUP MESSAGE CHANNELS")
+                hitGroupMessages = True
 
-      if (allPostsForChannelResponse.status_code != 200):
-        print("ERROR: Getting all posts for channel")
-        exit()
+            print(channelDisplayName)
+            # File_object.write("## " + channelDisplayName + '\n\n')
+            pdf.set_fill_color(255, 0, 0)
+            pdf.start_section(channelDisplayName, level=1)
+            # pdf.set_link(tableOfContents[channel["display_name"]])
+            # pdf.multi_cell(0, 5, messageHeader, 0, 'L', True)
+            # pdf.ln()
 
-      allPostsForChannel = allPostsForChannelResponse.json()
+            channelId = channel["id"]
 
-      postFiles = []
+            morePages = True
+            channelPostsCounter = 0
+            allPosts = []
+            allPostsFull = []
+            # Get all pages and append messages to one array.
+            # We reverse this array before processing so order is from older to newest when printing
 
-      if not allPostsForChannel["posts"]:
-        morePages = False
+            while (morePages):
 
-      channelPostsCounter += 1
+                allPostsForChannel = getPostsForChannel(channelId, channelPostsCounter)
 
-      for key in allPostsForChannel["order"]:
-        allPosts.append(allPostsForChannel["posts"][key])
-        allPostsFull.append(allPostsForChannel)
+                postFiles = []
 
-    # CACHE CHANNEL HERE
-    channelCache[channelId] = {
-      "channelName": channelDisplayName,
-      "posts": allPostsFull
-    }
+                if not allPostsForChannel["posts"]:
+                    morePages = False
 
-    # Reverse so it prints oldest to newest
-    allPosts.reverse()
+                channelPostsCounter += 1
 
-    # BEGIN POST PROCESSING
-    # Loop over posts for channel
-    for post in allPosts:
-        pictures = []
-        files = []
+                for key in allPostsForChannel["order"]:
+                    allPosts.append(allPostsForChannel["posts"][key])
+                    allPostsFull.append(allPostsForChannel)
 
-        message = post["message"]
-        if (isinstance(message, str)):
-          postUserId = post["user_id"]
+            # CACHE CHANNEL HERE
+            channelCache[channelId] = {
+                "channelName": channelDisplayName,
+                "posts": allPostsFull
+            }
 
-          theUser = getUser(postUserId)
+            # Reverse so it prints oldest to newest
+            allPosts.reverse()
 
-          # Files
-          if "metadata" in post and "files" in post["metadata"]:
-            postFiles = post["metadata"]["files"]
+            # BEGIN POST PROCESSING
+            # Loop over posts for channel
+            for post in allPosts:
+                pictures = []
+                files = []
 
-            if len(postFiles) > 0:
-              for file in postFiles:
-                # file["extension"] == "gif"
-                if file["extension"] == "png" or file["extension"] == "jpeg" or file["extension"] == "jpg":
-                  pictures.append(file)
+                message = post["message"]
+                if (isinstance(message, str)):
+                    postUserId = post["user_id"]
+
+                    theUser = getUser(postUserId)
+
+                    # Files
+                    if "metadata" in post and "files" in post["metadata"]:
+                        postFiles = post["metadata"]["files"]
+
+                        if len(postFiles) > 0:
+                            for file in postFiles:
+                                # file["extension"] == "gif"
+                                if file["extension"].lower() in imageExtenstions:
+                                    pictures.append(file)
+                                else:
+                                    files.append(file)
+
+                    postWithUserName = {
+                        "name": theUser["first_name"] + " " + theUser["last_name"],
+                        "message": message,
+                        "time": str(datetime.datetime.fromtimestamp(post["create_at"] / 1000).strftime("%m/%d/%Y, %I:%M:%S %p")),
+                        "pictures": pictures,
+                        "files": files,
+                        "post": post
+                    }
+
+                    if post["is_pinned"] == True:
+                        pinnedMessages.append(postWithUserName)
+
+                    messagesArray.append(postWithUserName)
+
+            print('Total Messages: ', len(messagesArray) + 1)
+            print('\n')
+
+            if len(pinnedMessages) > 0:
+                pdf.start_section("Pinned Messages", level=2)
+
+            # Loop through Pinned messages first, to put them all at the front
+            for message in pinnedMessages:
+                userName = message["name"]
+                singleMessage = message["message"]
+                time = message["time"]
+
+                #pdf.set_fill_color(220, 220, 220)
+                pdf.set_fill_color(255, 165, 0)
+                pdf.set_draw_color(255, 165, 0)
+                pdf.cell(0, 5, f'{handleUnicode(userName)} {time} Pinned', 0, align='L', fill=True)
+                pdf.set_fill_color(255, 255, 255)
+                pdf.ln()
+                pdf.multi_cell(0, 5, handleUnicode(singleMessage), 1, align='L', fill=True, markdown=True)
+                # pdf.write_html(marko.convert(singleMessage))
+                pdf.ln()
+
+            pdf.set_draw_color(0, 0, 0)
+            pdf.set_fill_color(220, 220, 220)
+            pdf.start_section("Regular Messages", level=2)
+
+            pdf.set_fill_color(255, 255, 255)
+            for message in messagesArray:
+                userName = message["name"]
+                singleMessage = message["message"]
+                time = message["time"]
+                post = message["post"]
+
+                if post["is_pinned"] == True:
+                    pdf.set_fill_color(255, 165, 0)
+                    pdf.set_draw_color(255, 165, 0)
+                    pdf.cell(0, 5, f'{handleUnicode(userName)} {time} Pinned', 0, align='L', fill=True)
+                    pdf.set_fill_color(255, 255, 255)
+
+                    pdf.ln()
+                    pdf.multi_cell(0, 5, handleUnicode(singleMessage), 1, align='L', fill=True, markdown=True)
+                    pdf.ln()
+                    pdf.set_draw_color(0, 0, 0)
                 else:
-                  files.append(file)
+                    pdf.set_fill_color(220, 220, 220)
+                    pdf.cell(0, 5, f'{handleUnicode(userName)} {time}', 0, align='L', fill=True)
+                    pdf.set_fill_color(255, 255, 255)
+                    pdf.ln()
+                    pdf.multi_cell(0, 5, handleUnicode(singleMessage), 0, align='L', fill=True, markdown=True)
+                    pdf.ln()
 
-                # APPEND IF FOR UNIQUENESS HERE TOO
-                # message = message + "\n" + "Attached file: " + file["id"] + "_" +file["name"]
 
-          postWithUserName = {
-            "name": theUser["first_name"] + " " + theUser["last_name"],
-            "message": message,
-            "time": str(datetime.datetime.fromtimestamp(post["create_at"] / 1000).strftime("%m/%d/%Y, %I:%M:%S %p")),
-            "pictures": pictures,
-            "files": files,
-            "post": post
-          }
+                if( options.images ):
+                    try:
+                        userPicturesFilePath = os.path.join( baseUserFilePath, "pics/" )
+                        os.makedirs( userPicturesFilePath, 0o755, True)
 
-          if post["is_pinned"] == True:
-            pinnedMessages.append(postWithUserName)
+                        for picture in message["pictures"]:
+                            try:
+                                # APPEND FILE ID TO PATH TO MAKE UNIQUE AND CACHE THIS
+                                imagePath = os.path.join( userPicturesFilePath,  f'{picture["id"]}_{picture["name"]}' )
+                                myImage = Path(imagePath)
 
-          messagesArray.append(postWithUserName)
+                                if not myImage.exists():
+                                    imageObj = getFile( picture["id"] )
 
-    print('Total Messages: ', len(messagesArray) + 1)
-    print('\n')
+                                    with open(imagePath, 'wb') as f:
+                                        imageObj.raw.decode_content = True
+                                        shutil.copyfileobj(imageObj.raw, f)
 
-    if len(pinnedMessages) > 0:
-      # pdf.set_fill_color(255, 165, 0)
-      # pdf.ln()
-      pdf.start_section("Pinned Messages", level=2)
-      # pdf.cell(0, 10, "Pinned Messages", 0, 1, 'C', True)
-      # pdf.ln()
+                                pdf.image(imagePath, w=(pdf.epw * .75), x=Align.C)
 
-    # Loop through Pinned messages first, to put them all at the front
-    for message in pinnedMessages:
-      userName = message["name"]
-      singleMessage = message["message"]
-      time = message["time"]
+                            except ImageException as ie:
+                                print( f'Embed Image error: {ie}' )
+                                #traceback.print_exc()
+                            except Exception as e:
+                                print('Embed Image error: Couldn\'t add picture to PDF')
+                                print( e )
+                                #traceback.print_exc()
 
-      pdf.set_fill_color(220, 220, 220)
-      pdf.set_draw_color(255, 165, 0)
-      pdf.cell(0, 5, handleUnicode(userName) + " " + time + " Pinned", 0, 0, 'L', True)
-      pdf.set_fill_color(255, 255, 255)
-      pdf.ln()
-      pdf.multi_cell(0, 5, handleUnicode(singleMessage), 1, 'L', True)
-      # pdf.write_html(marko.convert(singleMessage))
-      pdf.ln()
+                    except ImageException as ie:
+                        print( ie )
 
-    pdf.set_draw_color(0, 0, 0)
-    pdf.set_fill_color(220, 220, 220)
-    pdf.start_section("Regular Messages", level=2)
-    # pdf.cell(0, 10, "Regular Messages", 0, 1, 'C', True)
-    pdf.set_fill_color(255, 255, 255)
-    for message in messagesArray:
-      userName = message["name"]
-      singleMessage = message["message"]
-      time = message["time"]
-      post = message["post"]
+                if( options.files ):
+                    try:
+                        userAttachmentsFilePath = os.path.join( baseUserFilePath, "files/" )
+                        os.makedirs( userAttachmentsFilePath, 0o755, True)
 
-      pdf.set_fill_color(220, 220, 220)
-      if post["is_pinned"] == True:
-        pdf.set_draw_color(255, 165, 0)
-        pdf.cell(0, 5, handleUnicode(userName) + " " + time + " Pinned", 0, 0, 'L', True)
+                        for aFile in message["files"]:
+                            try:
+                                filePath = os.path.join( userAttachmentsFilePath, f'{aFile["id"]}_{aFile["name"]}' )
+                                myFile = Path(filePath)
 
-        pdf.set_fill_color(255, 255, 255)
+                                if not myFile.exists():
+                                    fileObj = getFile( aFile["id"] )
 
-        pdf.ln()
-        pdf.multi_cell(0, 5, handleUnicode(singleMessage), 1, 'L', True)
-        pdf.ln()
-        pdf.set_draw_color(0, 0, 0)
-      else:
-        pdf.cell(0, 5, handleUnicode(userName) + " " + time, 0, 0, 'L', True)
-        pdf.set_fill_color(255, 255, 255)
-        pdf.ln()
-        pdf.multi_cell(0, 5, handleUnicode(singleMessage), 0, 'L', True)
-        pdf.ln()
+                                    with open(filePath, 'wb') as f:
+                                        fileObj.raw.decode_content = True
+                                        shutil.copyfileobj(fileObj.raw, f)
+                                                                
+                                if myFile.is_file():                                    
+                                    pdf.embed_file( myFile, desc=aFile["name"], compress=True)
+                                    pdf.cell(30, 5, 'Attached file: ', 0, align='L', fill=True)
+                                    pdf.set_text_color(0, 0, 255)
+                                    pdf.cell(0, 5, f'{aFile["id"]}_{aFile["name"]}', 0, align='L', fill=True)
+                                    
+                            except FileException as fe:
+                                print( f'Embed File error: {fe}' )
+                                #traceback.print_exc()
+                            except Exception as e:
+                                print('Embed File error: Couldn\'t add file to PDF')
+                                print( e )
+                                #traceback.print_exc()
+                            finally:
+                                pdf.set_text_color(0, 0, 0)
+                                pdf.ln()
+                                
+                    except ImageException as ie:
+                        print( ie )
 
-      global baseUserPath
-      baseUserPath = f'./users/{getUser(userId)["username"]}/'
-      baseUserFilePath = baseUserPath + "files/"
-      userPicturesFilePath = baseUserFilePath + "pics/"
-      userAttachmentsFilePath = baseUserFilePath + "files/"
+        pdfOutput = os.path.join(baseUserPath, f'{options.user}.pdf' )
 
-      # for picture in message["pictures"]:
-      #   # APPEND FILE ID TO PATH TO MAKE UNIQUE AND CACHE THIS
-      #   filePath = userPicturesFilePath + picture["id"] + "_" + picture["name"]
-      #   my_file = Path(filePath)
-      #   if not my_file.exists():
-      #     getAFile = f'/files/{picture["id"]}'
-      #     fileResponse = requests.get(mattermostURL + getAFile, headers=headers, stream=True)
+        print( pdfOutput )
+        print()
+        pdf.add_page()
+        pdf.output( pdfOutput )
 
-      #     if (fileResponse.status_code != 200):
-      #       print("ERROR: Getting a picture")
-      #     else:
-      #       Path(userPicturesFilePath).mkdir(parents=True, exist_ok=True)
+        if( options.json ):
+            makeJsonFile(options.user)
 
-      #       with open(filePath, 'wb') as f:
-      #         fileResponse.raw.decode_content = True
-      #         shutil.copyfileobj(fileResponse.raw, f)
+    except Exception as e:
+        print( e )
+        #traceback.print_exc()
 
-      #         # print('Saved Picture')
 
-      #   try:
-      #     pdf.image(filePath, h = 25)
-      #   except:
-      #     print('Error: Couldn\'t save picture to PDF')
-      #     # PRINT THE IMAGE NAME TO FILE IN CASE OF ERROR
 
-      for aFile in message["files"]:
-        filePath = userAttachmentsFilePath + aFile["id"] + '_' + aFile["name"]
-        # my_file = Path(filePath)
-        # if not my_file.exists():
-        #   getAFile = f'/files/{aFile["id"]}'
-        #   fileResponse = requests.get(mattermostURL + getAFile, headers=headers, stream=True)
+#########################
+## Helper Functions
+##
 
-        #   if (fileResponse.status_code != 200):
-        #     print("ERROR: Getting a picture")
-        #   else:
-        #     Path(userAttachmentsFilePath).mkdir(parents=True, exist_ok=True)
+def getUser(userID):
+    '''
+    getUser
 
-        #     with open(filePath, 'wb') as f:
-        #       fileResponse.raw.decode_content = True
-        #       shutil.copyfileobj(fileResponse.raw, f)
+    Returns the user info for the given ID.
 
-        pdf.cell(30, 5, "Attached file: ", 0, 0, 'L', True)
-        pdf.set_text_color(0, 0, 255)
-        # pdf.cell(0, 5, file["id"] + "_" +file["name"], 0, 0, 'L', True, link="file:///./files/files/" + aFile["id"] + '_' + aFile["name"])
-        pdf.cell(0, 5, file["id"] + "_" +file["name"], 0, 0, 'L', True)
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln()
-        pdf.ln()
+        @param userID The user ID to look up
 
-          # print('Saved File')
+    :raises:
+        UserInfoException
+    '''
+    if userID not in users:
+        getUserResponse = requests.get(f'{mattermostURL}/users/{userID}',
+                                       headers=headers)
 
-  print("Writing to PDF file")
-  print(baseUserPath + "messages.pdf")
-  print()
-  Path(baseUserPath).mkdir(parents=True, exist_ok=True)
-  pdf.add_page()
-  pdf.output(baseUserPath + "messages.pdf", 'F')
-  makeJsonFile()
+        if (getUserResponse.status_code != 200):
+            raise UserInfoException(f'Failed to get user info for: {userID}')
 
-def getUser(userId):
-  if userId not in users:
-    getUser = f'/users/{userId}'
-    getUserResponse = requests.get(mattermostURL + getUser, headers=headers)
+        users[userID] = getUserResponse.json()
 
-    if (getUserResponse.status_code != 200):
-      print("ERROR: Getting user")
-      exit()
+    return users[userID]
 
-    user = getUserResponse.json()
 
-    users[userId] = user
+def getUserFromName(username):
+    '''
+    getUserFromName
 
-  return users[userId]
+    Retrieves the user info for the username.
 
-def setupChannelNameAndHeader(channel):
-  global messageHeader
-  global channelDisplayName
+        @param username the username to look up.
 
-  channelDisplayName = channel["display_name"]
-  # Direct messsages
-  # if len(channel["display_name"]) == 0:
-  if channel["type"] == 'D':
+    :raises:
+        UserIDException
+    '''
+    getUserIDResponse = requests.get(f'{mattermostURL}/users/username/{username}',
+                                     headers=headers)
+
+    if (getUserIDResponse.status_code != 200):
+      raise UserIDException(f'Failed to get user ID for: {username}')
+
+    return getUserIDResponse.json()
+
+
+def getTeam(team):
+    '''
+    getTeadID
+
+    Returns the ID for the team.
+
+        @param team the team name to look up.
+
+    :raises:
+        TeamIDException
+    '''
+
+    getTeamIDResponse = requests.get(f'{mattermostURL}/teams/name/{team}',
+                                     headers=headers)
+
+    if (getTeamIDResponse.status_code != 200):
+      raise TeamIDException(f'Failed to get user ID for: {username}')
+
+    return getTeamIDResponse.json()
+
+
+def getFile(fileID):
+    '''
+    getFile
+
+    Retrieves an attachement file from the server.
+
+        @param fileID the attachment ID/
+
+    :raises:
+        FileException
+    '''
+
+    getFileResponse = requests.get(f'{mattermostURL}/files/{fileID}',
+                                   headers=headers,
+                                   stream=True)
+
+    if (getFileResponse.status_code != 200):
+      raise FileException(f'Failed to get file[{fileID}], status code: {getFileResponse.status_code}')
+
+    return getFileResponse
+
+
+def getChannelsForAUser(userID, teamID):
+    '''
+    getChannelsForAUser
+
+    Get all Channels for a User
+
+        @param userID
+        @param teamID
+
+    :raises:
+        UserChannelsException
+    '''
+    allChannelsForUserResponse = requests.get(f'{mattermostURL}/users/{userID}/teams/{teamID}/channels?include_deleted=false&last_delete_at=0',
+                                              headers=headers)
+
+    if (allChannelsForUserResponse.status_code != 200):
+        raise UserChannelsException('Failed to get channels for user')
+
+    return allChannelsForUserResponse.json()
+
+
+def getPostsForChannel(channelID, channelPostsCounter):
+    '''
+    getPostsForChannel
+
+    Get all Posts for a Channels
+
+        @param channelID
+        @param channelPostsCounter
+
+    :raises:
+        ChannelPostsException
+    '''
+    getPostsForChannelResponse = requests.get(f'{mattermostURL}channels/{channelID}/posts?page={channelPostsCounter}', headers=headers)
+
+    if (getPostsForChannelResponse.status_code != 200):
+        raise ChannelPostsException('Failed to get posts for channels')
+
+    return getPostsForChannelResponse.json()
+
+
+def setupChannelNameAndHeader(channel, userID):
+    global messageHeader
+    global channelDisplayName
+
+    channelDisplayName = channel["display_name"]
+    # Direct messsages
+    # if len(channel["display_name"]) == 0:
+    if channel["type"] == 'D':
+        nameSplit = channel["name"].split("__")
+        firstPerson = getUser(nameSplit[0])
+        firstPersonFirstName = firstPerson["first_name"]
+        firstPersonLastName = firstPerson["last_name"]
+        firstPersonUserId = nameSplit[0]
+
+        secondPerson = getUser(nameSplit[1])
+        secondPersonFirstName = secondPerson["first_name"]
+        secondPersonLastName = secondPerson["last_name"]
+        secondPersonUserId = nameSplit[1]
+
+        if firstPersonUserId == userID:
+            otherPersonFirstName = secondPersonFirstName
+            otherPersonLastName = secondPersonLastName
+        else:
+            otherPersonFirstName = firstPersonFirstName
+            otherPersonLastName = firstPersonLastName
+
+        messageHeader = 'DM with ' + otherPersonFirstName + ' ' + otherPersonLastName
+        channelDisplayName = messageHeader
+    else:
+        # If MM Group message
+        if channel["type"] == 'G':
+            # Get Channel Members:
+            names = getChannelMembersFn(channel)
+
+            messageHeader = "Group Message between: " + names
+            channelDisplayName = messageHeader
+        # Public/Private Channels
+        else:
+            messageHeader = channelDisplayName
+
+
+def directMessageOtherUserName(channel, userID):
     nameSplit = channel["name"].split("__")
     firstPerson = getUser(nameSplit[0])
     firstPersonFirstName = firstPerson["first_name"]
@@ -363,180 +668,136 @@ def setupChannelNameAndHeader(channel):
     secondPersonLastName = secondPerson["last_name"]
     secondPersonUserId = nameSplit[1]
 
-    if firstPersonUserId == userId:
-      otherPersonFirstName = secondPersonFirstName
-      otherPersonLastName = secondPersonLastName
+    if firstPersonUserId == userID:
+        return secondPersonFirstName + secondPersonLastName
     else:
-      otherPersonFirstName = firstPersonFirstName
-      otherPersonLastName = firstPersonLastName
+        return firstPersonFirstName + firstPersonLastName
 
-    messageHeader = 'DM with ' + otherPersonFirstName + ' ' + otherPersonLastName
-    channelDisplayName = messageHeader
-  else:
-    # If MM Group message
-    if channel["type"] == 'G':
-      # Get Channel Members:
-      names = getChannelMembersFn(channel)
-
-      messageHeader = "Group Message between: " + names
-      channelDisplayName = messageHeader
-    # Public/Private Channels
-    else:
-      messageHeader = channelDisplayName
-
-def directMessageOtherUserName(channel):
-  nameSplit = channel["name"].split("__")
-  firstPerson = getUser(nameSplit[0])
-  firstPersonFirstName = firstPerson["first_name"]
-  firstPersonLastName = firstPerson["last_name"]
-  firstPersonUserId = nameSplit[0]
-
-  secondPerson = getUser(nameSplit[1])
-  secondPersonFirstName = secondPerson["first_name"]
-  secondPersonLastName = secondPerson["last_name"]
-  secondPersonUserId = nameSplit[1]
-
-  # print('First Person ID: ', firstPersonUserId)
-  # print('Actual User Id:', userId)
-  # print(firstPersonUserId == userId)
-  if firstPersonUserId == userId:
-    return secondPersonFirstName + secondPersonLastName
-  else:
-    return firstPersonFirstName + firstPersonLastName
 
 def getChannelMembersFn(channel):
-  channelMembersCounter = 0
-  morePages = True
-  names = ''
-  while(morePages):
-    getChannelMembers = f'/channels/{channel["id"]}/members?page={channelMembersCounter}'
-    getChannelMembersResponse = requests.get(mattermostURL + getChannelMembers, headers=headers)
+    channelMembersCounter = 0
+    morePages = True
+    names = ''
+    while(morePages):
+        getChannelMembers = f'/channels/{channel["id"]}/members?page={channelMembersCounter}'
+        getChannelMembersResponse = requests.get(mattermostURL + getChannelMembers, headers=headers)
 
-    if (getChannelMembersResponse.status_code != 200):
-      print("ERROR: Getting all posts for channel")
-      exit()
+        if (getChannelMembersResponse.status_code != 200):
+            raise ChannelPostsException("ERROR: Getting all posts for channel")
 
-    channelMembers = getChannelMembersResponse.json()
+        channelMembers = getChannelMembersResponse.json()
 
-    channelMembersCounter += 1
+        channelMembersCounter += 1
 
-    channelMembersLoopCounter = 0
-    for member in channelMembers:
-      user = getUser(member["user_id"])
+        channelMembersLoopCounter = 0
+        for member in channelMembers:
+            user = getUser(member["user_id"])
 
-      if channelMembersLoopCounter == len(channelMembers) - 1:
-        names += 'and ' + user["first_name"] + ' ' + user["last_name"]
-      else :
-        names += user["first_name"] + ' ' + user["last_name"] + ', '
+            if channelMembersLoopCounter == len(channelMembers) - 1:
+                names += 'and ' + user["first_name"] + ' ' + user["last_name"]
+            else:
+                names += user["first_name"] + ' ' + user["last_name"] + ', '
 
-      channelMembersLoopCounter += 1
+            channelMembersLoopCounter += 1
 
-    if len(channelMembers) == 0:
-      morePages = False
-      break
-  return names
+        if len(channelMembers) == 0:
+            morePages = False
+            break
+    return names
+
+
 
 def handleUnicode(text):
-  # newText = text.replace(u'\u2013', '-')
-  newText = text.encode('latin-1', 'replace').decode('latin-1')
-  return newText
-  # return text
+    newText = text.encode('latin-1', 'replace').decode('latin-1')
+    return newText
 
-class PDF(FPDF, HTMLMixin):
-  def __init__(self):
-    super().__init__()
 
-    SYSTEM_TTFONTS = './fonts'
 
-    self.add_font("NotoSans", style="", fname=SYSTEM_TTFONTS + "/NotoSans-Regular.ttf", uni=True)
-    self.add_font("NotoSans", style="B", fname=SYSTEM_TTFONTS + "/NotoSans-Bold.ttf", uni=True)
-    self.add_font("NotoSans", style="I", fname=SYSTEM_TTFONTS + "/NotoSans-Italic.ttf", uni=True)
-    self.add_font("NotoSans", style="BI", fname=SYSTEM_TTFONTS + "/NotoSans-BoldItalic.ttf", uni=True)
-    # self.add_font('DejaVu', '', 'DejaVuSansCondensed.ttf', uni=True)
-    self.set_font('NotoSans', '', 10)
+class PDF(FPDF):
+    def __init__(self):
+        super().__init__()
 
-    self.set_section_title_styles(
-      # Level 0 titles:
-      TitleStyle(
-          font_family="Times",
-          font_style="B",
-          font_size_pt=24,
-          color=(0,0,0),
-          underline=True,
-          t_margin=5,
-          l_margin=0,
-          b_margin=5,
-      ),
-      # Level 1 subtitles:
-      TitleStyle(
-          font_family="Times",
-          font_style="B",
-          font_size_pt=20,
-          color=(0,0,0),
-          underline=True,
-          t_margin=5,
-          l_margin=0,
-          b_margin=5,
-      ),
-      # Level 2 subtitles:
-      TitleStyle(
-          font_family="Times",
-          font_style="B",
-          font_size_pt=15,
-          color=(255, 165, 0),
-          underline=True,
-          t_margin=5,
-          l_margin=0,
-          b_margin=5,
-      )
-    )
+        SYSTEM_TTFONTS = '/usr/share/fonts/truetype'
 
-  def header(self):
-      # Select Arial bold 15
-      self.set_font("NotoSans", style='B', size=12)
-      # Move to the right
-      self.cell(80)
-      # Framed title
-      self.cell(30, 10, channelDisplayName, 0, 2, 'C')
-      # Line break
-      self.ln(15)
-  def footer(self):
-      # Go to 1.5 cm from bottom
-      self.set_y(-15)
-      # Select Arial italic 8
-      self.set_font("NotoSans", style='I', size=8)
-      # Print centered page number
-      self.cell(0, 10, 'Page %s' % self.page_no(), 0, 2, 'C')
+        self.add_font("NotoSans", style="", fname=os.path.join(SYSTEM_TTFONTS, "noto/NotoSans-Regular.ttf"))
+        self.add_font("NotoSans", style="B", fname=os.path.join(SYSTEM_TTFONTS, "noto/NotoSans-Bold.ttf"))
+        self.add_font("NotoSans", style="I", fname=os.path.join(SYSTEM_TTFONTS, "noto/NotoSans-Italic.ttf"))
+        self.add_font("NotoSans", style="BI", fname=os.path.join(SYSTEM_TTFONTS, "noto/NotoSans-BoldItalic.ttf"))
+        self.set_font('NotoSans', '', 10)
 
-def render_toc(pdf, outline):
-  pdf.y += 10
-  # pdf.set_font("Helvetica", size=16)
-  pdf.underline = True
-  p(pdf, "Table of contents:")
-  pdf.underline = False
-  pdf.y += 5
-  # pdf.set_font("Courier", size=12)
-  for section in outline:
-      print(section)
-      link = pdf.add_link()
-      pdf.set_link(link, page=section.page_number)
-      text = f'{" " * section.level * 4} {section.name}'
-      text += (
-          f' {"." * (60 - section.level*2 - len(section.name))} {section.page_number}'
-      )
-      pdf.multi_cell(w=pdf.epw, h=pdf.font_size, txt=text, ln=1, align="L", link=link)
+        self.set_section_title_styles(
 
-def p(pdf, text, **kwargs):
-    pdf.multi_cell(w=pdf.epw, h=pdf.font_size, txt=text, ln=1, **kwargs)
+            # Level 0 titles:
+            TitleStyle(
+                font_family="Times",
+                font_style="B",
+                font_size_pt=24,
+                color=(0,0,0),
+                underline=True,
+                t_margin=5,
+                l_margin=0,
+                b_margin=5,
+            ),
+            # Level 1 subtitles:
+            TitleStyle(
+                font_family="Times",
+                font_style="B",
+                font_size_pt=20,
+                color=(0,0,0),
+                underline=True,
+                t_margin=5,
+                l_margin=0,
+                b_margin=5,
+            ),
+            # Level 2 subtitles:
+            TitleStyle(
+                font_family="Times",
+                font_style="B",
+                font_size_pt=15,
+                color=(255, 165, 0),
+                underline=True,
+                t_margin=5,
+                l_margin=0,
+                b_margin=5,
+            )
+        )
 
-def makeJsonFile():
-  ## PRINT STATEMENT FOR JSON FILE NEEDED
-  filePath = baseUserPath + "messages.gz"
-  print("Writing JSON to file")
-  print(filePath)
-  with gzip.open(filePath, 'wt', encoding="ascii") as zipfile:
-    json.dump(channelCache, zipfile)
-  # with open(filePath, "w+") as outfile:
-  #   json.dump(channelCache, outfile)
+    def header(self):
+        # Select Arial bold 15
+        self.set_font("NotoSans", style='B', size=12)
 
-main()
+        if( channelDisplayName ):
+            self.multi_cell(w=0, txt=channelDisplayName, align='C')
+
+        # Line break
+        self.ln(15)
+
+
+    def footer(self):
+        # Go to 1.5 cm from bottom
+        self.set_y(-15)
+        # Select Arial italic 8
+        self.set_font("NotoSans", style='I', size=8)
+        # Print centered85 page number
+        self.cell(0, 10, f'Page {self.page_no()}', 0, align='C')
+
+
+def makeJsonFile(username):
+    '''
+    makeJsonFile
+
+    Export the messages as JSON
+
+        @param username
+
+    '''
+    ## PRINT STATEMENT FOR JSON FILE NEEDED
+    jsonPath = os.path.join( baseUserPath, f'{username}.gz' )
+    print("Writing JSON to file")
+    print(jsonPath)
+    with gzip.open(jsonPath, 'wt', encoding="ascii") as zipfile:
+        json.dump(channelCache, zipfile)
+
+
+if __name__ == '__main__':
+  main()
