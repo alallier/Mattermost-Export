@@ -136,10 +136,10 @@ def processOptions():
         servergroup.add_argument("-s", "--server", help="Hostname or IP of the server", action="store", dest="server", default="mattermost.com")
 
         categorygroup = parser.add_argument_group(title='Channel Categories')
-        categorygroup.add_argument("-p", "--public", help="Exclude public channels", action="store_false", dest="public")
-        categorygroup.add_argument("-P", "--private", help="Exclude private channels", action="store_false", dest="private")
-        categorygroup.add_argument("-g", "--groups", help="Exclude group messages", action="store_false", dest="group")
-        categorygroup.add_argument("-d", "--DMs", help="Exclude direct messages", action="store_false", dest="dms")
+        categorygroup.add_argument("-p", "--public", help="Exclude public channels", action="store_true", dest="public")
+        categorygroup.add_argument("-P", "--private", help="Exclude private channels", action="store_true", dest="private")
+        categorygroup.add_argument("-g", "--groups", help="Exclude group messages", action="store_true", dest="group")
+        categorygroup.add_argument("-d", "--DMs", help="Exclude direct messages", action="store_true", dest="dms")
 
         filtergroup = parser.add_argument_group(title='Message Filters')
         filtergroup.add_argument("-I", "--include", help="Only inlcude these channels in the export.", nargs='*', dest="include", default=[])
@@ -173,7 +173,7 @@ def main():
 
         options = processOptions()
 
-        if (not (options.public or options.private or options.group or options.dms) ):
+        if (options.public and options.private and options.group and options.dms):
             raise OptionsException( 'At least one channel category must be exported' )
 
         # Setup
@@ -213,16 +213,16 @@ def main():
         for channel in allChannelsForUser:            
             if ( channel["display_name"] not in options.exclude):
                 if ( (not options.include) or (channel["display_name"] in options.include) ):
-                    if (options.public and channel["type"] == 'O'):
+                    if ((not options.public) and channel["type"] == 'O'):
                         publicChannels.append(channel)
 
-                    if (options.private and channel["type"] == 'P'):
+                    if ((not options.private) and channel["type"] == 'P'):
                         privateChannels.append(channel)
 
-                    if (options.dms and channel["type"] == 'D'):
+                    if ((not options.dms) and channel["type"] == 'D'):
                         directMessageChannels.append(channel)
 
-                    if (options.group and channel["type"] == 'G'):
+                    if ((not options.group) and channel["type"] == 'G'):
                         groupChannels.append(channel)
 
         # Pre-process names in direct messages so we can sort by the other user's name
