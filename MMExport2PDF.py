@@ -299,7 +299,8 @@ def main():
 
                 for key in allPostsForChannel["order"]:
                     allPosts.append(allPostsForChannel["posts"][key])
-                    allPostsFull.append(allPostsForChannel)
+
+                allPostsFull.append(allPostsForChannel)
 
             # CACHE CHANNEL HERE
             channelCache[channelId] = {
