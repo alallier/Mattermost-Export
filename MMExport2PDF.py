@@ -548,7 +548,7 @@ def getTeam(team):
                                      headers=headers)
 
     if (getTeamIDResponse.status_code != 200):
-      raise TeamIDException(f'Failed to get user ID for: {username}')
+      raise TeamIDException(f'Failed to get team ID for: {team}')
 
     return getTeamIDResponse.json()
 
